@@ -1,15 +1,14 @@
-# eval_addition_tiny_transformer.py
-# Evaluate a trained tiny addition LM on A+B=C# sequences.
-# Usage:
-#   python eval_addition_tiny_transformer.py --ckpt tiny_addition_lm.pt --tests 5000 --max-digits 3
+# eval_addition_exhaustive.py
+# Exhaustively evaluate a trained tiny addition LM on all pairs 0..999 + 0..999.
+# Usage examples:
+#   python eval_addition_exhaustive.py --ckpt tiny_addition_lm.pt --state-dict
+#   python eval_addition_exhaustive.py --ckpt tiny_addition_lm_full.pt
 
-import math, random, argparse
+import math, argparse, time
 import torch
 import torch.nn as nn
 
-# --------------------------
-# Vocab and helpers (must match training)
-# --------------------------
+# --- Vocab & helpers (must match training) ---
 VOCAB = list("0123456789+ =#")
 stoi = {ch:i for i,ch in enumerate(VOCAB)}
 itos = {i:ch for ch,i in stoi.items()}
@@ -18,20 +17,10 @@ vocab_size = len(VOCAB)
 def encode(s): return torch.tensor([stoi[c] for c in s], dtype=torch.long)
 def decode(t): return "".join(itos[int(i)] for i in t)
 
-def make_example(n_digits_a=3, n_digits_b=3):
-    A = random.randint(0, 10**n_digits_a - 1)
-    B = random.randint(0, 10**n_digits_b - 1)
-    return f"{A}+{B}={A+B}#"
+def make_prompt(A, B): return f"{A}+{B}="
+def make_target(A, B): return f"{A}+{B}={A+B}#"
 
-def make_prompt(A, B):
-    return f"{A}+{B}="
-
-def make_target(A, B):
-    return f"{A}+{B}={A+B}#"
-
-# --------------------------
-# Model (identical to training)
-# --------------------------
+# --- Tiny Transformer definition (must match training if using --state-dict) ---
 class CausalSelfAttention(nn.Module):
     def __init__(self, n_embd, n_head, block_size):
         super().__init__()
@@ -98,7 +87,6 @@ class TinyTransformerLM(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens=16):
-        # Greedy generation until '#' or max_new_tokens
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.block_size:]
             logits, _ = self(idx_cond)
@@ -109,118 +97,110 @@ class TinyTransformerLM(nn.Module):
                 break
         return idx
 
-# --------------------------
-# Evaluation
-# --------------------------
-def count_digits(n: int) -> int:
-    return 1 if n == 0 else len(str(abs(n)))
-
+# --- Exhaustive evaluation ---
 @torch.no_grad()
-def eval_random(model, device, tests=5000, max_digits=3):
+def exhaustive_eval(model, device, max_a=999, max_b=999, show_every=50000, save_first_n_errors=50, error_outfile=None):
     model.eval()
+    total = (max_a + 1) * (max_b + 1)
     correct = 0
-    per_bucket = {(1,1): [0,0], (1,2): [0,0], (1,3): [0,0],
-                  (2,1): [0,0], (2,2): [0,0], (2,3): [0,0],
-                  (3,1): [0,0], (3,2): [0,0], (3,3): [0,0]}
+    errors = []
+    t0 = time.time()
 
-    for _ in range(tests):
-        da = random.randint(1, max_digits)
-        db = random.randint(1, max_digits)
-        A = random.randint(0, 10**da - 1)
-        B = random.randint(0, 10**db - 1)
-        prompt = make_prompt(A,B)
-        target = make_target(A,B)
+    # Precompute a safe max_new_tokens: worst-case "999+999=1998#" is 13 chars;
+    # prompts like "A+B=" length varies; we cap extra generation at 12 to cover result + '#'.
+    MAX_NEW = 12
 
-        ctx = encode(prompt).unsqueeze(0).to(device)
-        out = model.generate(ctx, max_new_tokens=16)[0].cpu().numpy()
-        pred = decode(out)
+    for a in range(max_a + 1):
+        for b in range(max_b + 1):
+            prompt = f"{a}+{b}="
+            target = f"{a}+{b}={a+b}#"
 
-        ok = (pred == target)
-        correct += int(ok)
+            ctx = encode(prompt).unsqueeze(0).to(device)
+            out = model.generate(ctx, max_new_tokens=MAX_NEW)[0].cpu().numpy()
+            pred = decode(out)
 
-        key = (count_digits(A), count_digits(B))
-        if key in per_bucket:
-            per_bucket[key][0] += int(ok)
-            per_bucket[key][1] += 1
+            if pred == target:
+                correct += 1
+            else:
+                if len(errors) < save_first_n_errors:
+                    errors.append((prompt, pred, target))
 
-    overall = correct / tests
-    per_bucket_acc = {k: (v[0]/v[1] if v[1] else 0.0) for k,v in per_bucket.items()}
-    return overall, per_bucket_acc
+        # progress
+        done = (a + 1) * (max_b + 1)
+        if show_every and done % show_every == 0:
+            rate = done / max(1, (time.time() - t0))
+            print(f"Progress: {done}/{total} ({done/total*100:.2f}%)  acc_so_far={correct/done*100:.2f}%  speed ~{rate:.0f} samples/s")
 
-@torch.no_grad()
-def eval_edges(model, device):
-    model.eval()
-    cases = [
-        (0,0), (0,9), (9,0), (9,9),
-        (10,0), (0,10), (10,9), (9,10),
-        (99,1), (1,99), (99,99),
-        (100,0), (0,100), (100,1), (1,100), (100,99), (99,100),
-        (999,0), (0,999), (999,1), (1,999), (999,999)
-    ]
-    results = []
-    ok_count = 0
-    for A,B in cases:
-        prompt = make_prompt(A,B)
-        target = make_target(A,B)
-        ctx = encode(prompt).unsqueeze(0).to(device)
-        out = model.generate(ctx, max_new_tokens=16)[0].cpu().numpy()
-        pred = decode(out)
-        ok = (pred == target)
-        ok_count += int(ok)
-        results.append((prompt, pred, target, ok))
-    return ok_count, len(cases), results
+    acc = correct / total
+    print(f"\nExhaustive accuracy 0..{max_a} + 0..{max_b}: {correct}/{total} = {acc*100:.4f}%")
+
+    if errors:
+        print(f"\nFirst {len(errors)} errors:")
+        for p, pred, tgt in errors:
+            print(f"  {p} -> {pred}   (expected {tgt})")
+
+        # Optional: save to file
+        if error_outfile:
+            with open(error_outfile, "w") as f:
+                for p, pred, tgt in errors:
+                    f.write(f"{p}\t{pred}\t{tgt}\n")
+            print(f"Saved first {len(errors)} errors to {error_outfile}")
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, required=True, help="Path to model checkpoint (e.g., tiny_addition_lm.pt)")
-    parser.add_argument("--tests", type=int, default=5000, help="Number of random tests")
-    parser.add_argument("--max-digits", type=int, default=3, help="Max digits per operand in random tests")
-    parser.add_argument("--block-size", type=int, default=32)
-    parser.add_argument("--embed", type=int, default=64)
-    parser.add_argument("--heads", type=int, default=2)
-    parser.add_argument("--layers", type=int, default=2)
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", required=True, help="Path to checkpoint (.pt)")
+    ap.add_argument("--state-dict", action="store_true",
+                    help="Load as weights-only state_dict; if not set, loads full pickled model.")
+    ap.add_argument("--embed", type=int, default=64)
+    ap.add_argument("--heads", type=int, default=2)
+    ap.add_argument("--layers", type=int, default=2)
+    ap.add_argument("--block-size", type=int, default=32)
+    ap.add_argument("--max-a", type=int, default=999)
+    ap.add_argument("--max-b", type=int, default=999)
+    ap.add_argument("--save-errors", type=str, default=None,
+                    help="Optional path to save first N errors (tab-separated)")
+    ap.add_argument("--n-errors", type=int, default=50, help="How many errors to save/show")
+    ap.add_argument("--progress-step", type=int, default=50000)
+    args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
 
-    # Build model with the same hyperparams as training (override via args if needed)
-    model = TinyTransformerLM(
-        vocab_size=vocab_size,
-        n_embd=args.embed,
-        n_head=args.heads,
-        n_layer=args.layers,
-        block_size=args.block_size
-    ).to(device)
+    if args.state_dict:
+        # Recreate architecture exactly as during training
+        model = TinyTransformerLM(
+            vocab_size=vocab_size,
+            n_embd=args.embed,
+            n_head=args.heads,
+            n_layer=args.layers,
+            block_size=args.block_size
+        ).to(device)
+        sd = torch.load(args.ckpt, map_location=device)
+        # Allow plain dict or {"state_dict":...}
+        if isinstance(sd, dict) and "state_dict" in sd:
+            sd = sd["state_dict"]
+        model.load_state_dict(sd, strict=True)
+    else:
+        # Load full pickled model
+        model = torch.load(args.ckpt, map_location=device)
+        model.to(device)
+        model.eval()
 
-    # Load weights
-    sd = torch.load(args.ckpt, map_location=device)
-    model.load_state_dict(sd)
-    model.eval()
-    print(f"Loaded checkpoint: {args.ckpt}")
-
-    # Quick sanity demos
+    # Quick sanity demo
     demos = ["3+5=", "12+7=", "42+58=", "3+111=", "999+1="]
-    print("\n--- Demo generations ---")
+    print("\nSanity demos:")
     for p in demos:
         out = model.generate(encode(p).unsqueeze(0).to(device), max_new_tokens=12)[0].cpu().numpy()
         print(p, "→", decode(out))
 
-    # Random evaluation
-    overall, per_bucket = eval_random(model, device, tests=args.tests, max_digits=args.max_digits)
-    print(f"\n--- Random test accuracy ({args.tests} samples, up to {args.max_digits} digits) ---")
-    print(f"Overall exact-string accuracy: {overall*100:.2f}%")
-    print("By operand digit count (A_digits, B_digits):")
-    for k in sorted(per_bucket.keys()):
-        print(f"  {k}: {per_bucket[k]*100:.2f}%")
-
-    # Edge cases
-    ok, total, results = eval_edges(model, device)
-    print(f"\n--- Edge-case set ---")
-    print(f"Edge-case exact-string accuracy: {ok}/{total} = {ok/total*100:.2f}%")
-    for prompt, pred, target, okflag in results:
-        status = "OK " if okflag else "ERR"
-        print(f"[{status}] {prompt}  ->  {pred}  (expected {target})")
+    # Run exhaustive eval
+    exhaustive_eval(
+        model, device,
+        max_a=args.max_a, max_b=args.max_b,
+        show_every=args.progress_step,
+        save_first_n_errors=args.n_errors,
+        error_outfile=args.save_errors
+    )
 
 if __name__ == "__main__":
     main()
