@@ -1,10 +1,10 @@
 # eval_addition_tiny_transformer.py
-# Exhaustive, batched, resumable evaluation for the conditional addition LM.
-# Usage examples:
-#   python eval_addition_tiny_transformer.py --ckpt addition_cond_weights.pt --state-dict
-#   python eval_addition_tiny_transformer.py --ckpt addition_cond_full.pt
-#   python eval_addition_tiny_transformer.py --ckpt addition_cond_weights.pt --state-dict --save-errors errs.tsv
-#   python eval_addition_tiny_transformer.py --ckpt addition_cond_weights.pt --state-dict --resume-a 400 --save-state eval_state.json
+# Exhaustive or random evaluation (batched, with error logging and optional resume).
+# Examples:
+#   FULL (exhaustive, 1,000,000 pairs)
+#     python eval_addition_tiny_transformer.py --ckpt addition_cond_weights.pt --state-dict --mode full
+#   RANDOM (e.g., 50k random pairs)
+#     python eval_addition_tiny_transformer.py --ckpt addition_cond_weights.pt --state-dict --mode random --samples 50000
 
 import math, argparse, time, json, os, sys
 import torch
@@ -17,9 +17,20 @@ VOCAB = list("0123456789+ =#")
 stoi = {ch:i for i,ch in enumerate(VOCAB)}
 itos = {i:ch for ch,i in stoi.items()}
 vocab_size = len(VOCAB)
+PAD_ID  = stoi[' ']
+EOS_ID  = stoi['#']
+PLUS_ID = stoi['+']
+EQ_ID   = stoi['=']
 
 def encode(s): return torch.tensor([stoi[c] for c in s], dtype=torch.long)
 def decode(t): return "".join(itos[int(i)] for i in t)
+
+def trim_to_eos(ids_row: torch.Tensor) -> torch.Tensor:
+    hits = (ids_row == EOS_ID).nonzero(as_tuple=False)
+    if hits.numel() == 0:
+        return ids_row
+    end = int(hits[0]) + 1
+    return ids_row[:end]
 
 # --------------------------
 # Model (must match training if using --state-dict)
@@ -75,19 +86,42 @@ class TinyTransformerLM(nn.Module):
         x = self.ln_f(x)
         return self.head(x)
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens=8):
-        # Greedy generation until '#' or max_new_tokens (row-wise)
+    def generate(self, idx, max_new_tokens=8, stop_id=EOS_ID):
+        """
+        Greedy generation with simple constraints:
+        - Disallow PAD (' '), '+' and '=' in generated tail.
+        - Stop early once '#' (EOS) is produced for a row.
+        """
+        B = idx.size(0)
+        finished = torch.zeros(B, dtype=torch.bool, device=idx.device)
+
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.block_size:]
-            logits = self(idx_cond)
-            probs = torch.softmax(logits[:, -1, :], dim=-1)
-            next_id = torch.argmax(probs, dim=-1, keepdim=True)
-            idx = torch.cat([idx, next_id], dim=1)
-            # Do NOT early-stop the whole batch; rows can finish at different steps
+            logits = self(idx_cond)[:, -1, :]  # (B, vocab)
+
+            # Ban tokens that should never appear in the answer tail
+            logits[:, PAD_ID]  = -1e9
+            logits[:, PLUS_ID] = -1e9
+            logits[:, EQ_ID]   = -1e9
+
+            probs = torch.softmax(logits, dim=-1)
+            next_id = torch.argmax(probs, dim=-1)  # (B,)
+
+            # For sequences already finished, force EOS to be repeated (no change)
+            next_id = torch.where(finished, torch.full_like(next_id, stop_id), next_id)
+
+            # Append
+            idx = torch.cat([idx, next_id.unsqueeze(1)], dim=1)
+
+            # Update finished mask
+            finished |= (next_id == stop_id)
+            if finished.all():
+                break
+
         return idx
 
 # --------------------------
-# Batched, resumable exhaustive eval with error printing
+# FULL (exhaustive) eval with error printing + resume
 # --------------------------
 @torch.no_grad()
 def exhaustive_eval_print_errors(
@@ -106,9 +140,8 @@ def exhaustive_eval_print_errors(
     model.eval()
     total = (max_a + 1) * (max_b + 1)
     correct = 0
-    seen = 0
-    t0 = time.time()
     PAD = stoi[' ']
+    t0 = time.time()
     err_file = open(save_errors, "w", buffering=1) if save_errors else None
     saved_errs = 0
 
@@ -120,33 +153,36 @@ def exhaustive_eval_print_errors(
             err_file.write(f"{prompt}\t{pred}\t{expected}\n")
             saved_errs += 1
 
-    # Iterate row-wise on 'a' so we can checkpoint per-row
     for a in range(resume_a, max_a + 1):
-        # Build all prompts for this 'a'
+        # Build this row of prompts/targets
         row_prompts = [f"{a}+{b}=" for b in range(max_b + 1)]
-        row_targets = [f"{a+b}#"  for b in range(max_b + 1)]
+        row_targets = [f"{a+b}#" for b in range(max_b + 1)]
 
-        # Sub-batch across 'b'
         s = 0
         while s < len(row_prompts):
             e = min(s + batch_size, len(row_prompts))
             batch_prompts = row_prompts[s:e]
             batch_targets = row_targets[s:e]
 
-            # Pad prompts batch
+            # --- SAFETY CHECK: no leading spaces in prompts
+            for p in batch_prompts:
+                assert not p or p[0] != ' ', f"Prompt has leading space: {repr(p)}"
+
+            # Pad prompts
             lens = [len(p) for p in batch_prompts]
             T = max(lens)
             X = torch.full((e - s, T), PAD, dtype=torch.long)
             for r, p in enumerate(batch_prompts):
-                X[r, :len(p)] = encode(p)
+                t = encode(p)
+                X[r, :len(p)] = t
             X = X.to(device)
 
-            # Generate up to 8 new tokens (max result length is 5 for 1998#)
+            # Generate (includes prompt + generated tail)
             out = model.generate(X, max_new_tokens=8).cpu()
 
-            # Compare predictions
+            # Compare
             for r in range(out.size(0)):
-                pred = decode(out[r])
+                pred = decode(trim_to_eos(out[r]))
                 expected = batch_prompts[r] + batch_targets[r]
                 if pred == expected:
                     correct += 1
@@ -154,25 +190,24 @@ def exhaustive_eval_print_errors(
                     log_error(batch_prompts[r], pred, expected)
                     if fail_fast:
                         if err_file: err_file.close()
-                        acc = correct / (seen + r + 1)
+                        done = a * (max_b + 1) + (s + r + 1)
+                        acc = correct / done
                         print(f"\nStopped on first error. Acc so far: {acc*100:.4f}%")
                         return
             s = e
-            seen += (e - (s - (e - s)))  # increment as we go; simpler: seen = (a - resume_a)*(max_b+1) + e
 
-        # End of row: update progress & checkpoint
-        seen = (a - resume_a + 1) * (max_b + 1)
+        # Progress + checkpoint per-row
         done_global = (a + 1) * (max_b + 1)
         if done_global % progress_step == 0 or done_global == total:
             elapsed = time.time() - t0
             rate = done_global / max(1e-6, elapsed)
             acc = correct / done_global
-            print(f"Progress: {done_global}/{total} ({done_global/total*100:.2f}%) "
-                  f"acc={acc*100:.4f}%  ~{int(rate)} samp/s")
+            print(f"Progress: {done_global}/{total} ({done_global/total*100:.2f}%) acc={acc*100:.4f}%  ~{int(rate)} samp/s")
 
         if save_state_path:
             state = {
-                "resume_a": a + 1,          # next a to evaluate
+                "mode": "full",
+                "resume_a": a + 1,  # next a
                 "correct": correct,
                 "done": done_global,
                 "total": total,
@@ -187,6 +222,88 @@ def exhaustive_eval_print_errors(
     print(f"\nFinal accuracy 0..{max_a} + 0..{max_b}: {correct}/{total} = {final_acc*100:.4f}%")
 
 # --------------------------
+# RANDOM eval with error printing (non-resumable)
+# --------------------------
+@torch.no_grad()
+def random_eval_print_errors(
+    model,
+    device,
+    samples=50000,
+    max_a=999,
+    max_b=999,
+    batch_size=8192,
+    progress_step=100_000,
+    save_errors=None,
+    max_errors_to_save=1000,
+    fail_fast=False,
+    seed=1234,
+):
+    import random
+    model.eval()
+    PAD = stoi[' ']
+    err_file = open(save_errors, "w", buffering=1) if save_errors else None
+    saved_errs = 0
+    correct = 0
+    t0 = time.time()
+    random.seed(seed)
+
+    def log_error(prompt, pred, expected):
+        nonlocal saved_errs
+        line = f"ERR  {prompt} -> {pred}   (expected {expected})"
+        print(line)
+        if err_file and saved_errs < max_errors_to_save:
+            err_file.write(f"{prompt}\t{pred}\t{expected}\n")
+            saved_errs += 1
+
+    # Build all random pairs up-front for determinism / repeatability
+    pairs = [(random.randint(0, max_a), random.randint(0, max_b)) for _ in range(samples)]
+
+    # Batched loop
+    s = 0
+    while s < samples:
+        e = min(s + batch_size, samples)
+        batch_prompts = [f"{a}+{b}=" for (a,b) in pairs[s:e]]
+        batch_targets = [f"{a+b}#" for (a,b) in pairs[s:e]]
+
+        # --- SAFETY CHECK: no leading spaces in prompts
+        for p in batch_prompts:
+            assert not p or p[0] != ' ', f"Prompt has leading space: {repr(p)}"
+
+        lens = [len(p) for p in batch_prompts]
+        T = max(lens)
+        X = torch.full((e - s, T), PAD, dtype=torch.long)
+        for r, p in enumerate(batch_prompts):
+            t = encode(p)
+            X[r, :len(p)] = t  # LEFT-ALIGN, RIGHT-PAD (matches training)
+        X = X.to(device)
+
+        out = model.generate(X, max_new_tokens=8).cpu()
+
+        for r in range(out.size(0)):
+            pred = decode(trim_to_eos(out[r]))
+            expected = batch_prompts[r] + batch_targets[r]
+            if pred == expected:
+                correct += 1
+            else:
+                log_error(batch_prompts[r], pred, expected)
+                if fail_fast:
+                    if err_file: err_file.close()
+                    acc = correct / (s + r + 1)
+                    print(f"\nStopped on first error. Acc so far: {acc*100:.4f}%")
+                    return
+        s = e
+
+        if s % progress_step == 0 or s == samples:
+            elapsed = time.time() - t0
+            rate = s / max(1e-6, elapsed)
+            acc = correct / s
+            print(f"Progress: {s}/{samples} ({s/samples*100:.2f}%) acc={acc*100:.4f}%  ~{int(rate)} samp/s")
+
+    if err_file: err_file.close()
+    final_acc = correct / samples
+    print(f"\nFinal random-eval accuracy ({samples} samples): {final_acc*100:.4f}%")
+
+# --------------------------
 # CLI
 # --------------------------
 def main():
@@ -198,15 +315,22 @@ def main():
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--block-size", type=int, default=32)
+    ap.add_argument("--mode", choices=["full","random"], default="full",
+                    help="full = evaluate all 0..max-a x 0..max-b; random = sample uniformly.")
     ap.add_argument("--max-a", type=int, default=999)
     ap.add_argument("--max-b", type=int, default=999)
     ap.add_argument("--batch-size", type=int, default=8192)
     ap.add_argument("--progress-step", type=int, default=100000)
-    ap.add_argument("--resume-a", type=int, default=0, help="Row index 'a' to resume from.")
-    ap.add_argument("--save-state", type=str, default=None, help="Path to JSON checkpoint for resumable eval.")
+    # full-mode resume
+    ap.add_argument("--resume-a", type=int, default=0, help="(full mode) Row index 'a' to resume from.")
+    ap.add_argument("--save-state", type=str, default=None, help="(full mode) Path to JSON checkpoint for resumable eval.")
+    # errors
     ap.add_argument("--save-errors", type=str, default=None, help="Optional TSV file to save first N errors.")
     ap.add_argument("--max-errors-to-save", type=int, default=1000)
     ap.add_argument("--fail-fast", action="store_true")
+    # random-mode options
+    ap.add_argument("--samples", type=int, default=50000, help="(random mode) Number of random pairs to evaluate.")
+    ap.add_argument("--seed", type=int, default=1234, help="(random mode) RNG seed for reproducibility.")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -229,36 +353,50 @@ def main():
         model = torch.load(args.ckpt, map_location=device).to(device)
     model.eval()
 
-    # Auto-resume from save-state (if present)
+    # Quick sanity demos
+    demos = ["3+5=", "12+7=", "42+58=", "3+111=", "999+1="]
+    for p in demos:
+        X = encode(p).unsqueeze(0).to(device)
+        out = model.generate(X, max_new_tokens=8)[0].cpu()
+        print(p, "→", decode(trim_to_eos(out)))
+
+    # Auto-resume (full mode only) if save-state present
     resume_a = args.resume_a
-    if args.save_state and os.path.exists(args.save_state):
+    if args.mode == "full" and args.save_state and os.path.exists(args.save_state):
         try:
             with open(args.save_state) as f:
                 st = json.load(f)
-                if "resume_a" in st:
+                if st.get("mode") == "full" and "resume_a" in st:
                     resume_a = max(resume_a, int(st["resume_a"]))
                     print(f"Resuming from a={resume_a}")
         except Exception:
             pass
 
-    # Quick sanity demos
-    demos = ["3+5=", "12+7=", "42+58=", "3+111=", "999+1="]
-    for p in demos:
-        X = encode(p).unsqueeze(0).to(device)
-        out = model.generate(X, max_new_tokens=8)[0].cpu().numpy()
-        print(p, "→", decode(out))
-
-    exhaustive_eval_print_errors(
-        model, device,
-        max_a=args.max_a, max_b=args.max_b,
-        batch_size=args.batch_size,
-        progress_step=args.progress_step,
-        resume_a=resume_a,
-        save_state_path=args.save_state,
-        save_errors=args.save_errors,
-        max_errors_to_save=args.max_errors_to_save,
-        fail_fast=args.fail_fast,
-    )
+    # Run selected mode
+    if args.mode == "full":
+        exhaustive_eval_print_errors(
+            model, device,
+            max_a=args.max_a, max_b=args.max_b,
+            batch_size=args.batch_size,
+            progress_step=args.progress_step,
+            resume_a=resume_a,
+            save_state_path=args.save_state,
+            save_errors=args.save_errors,
+            max_errors_to_save=args.max_errors_to_save,
+            fail_fast=args.fail_fast,
+        )
+    else:
+        random_eval_print_errors(
+            model, device,
+            samples=args.samples,
+            max_a=args.max_a, max_b=args.max_b,
+            batch_size=args.batch_size,
+            progress_step=args.progress_step,
+            save_errors=args.save_errors,
+            max_errors_to_save=args.max_errors_to_save,
+            fail_fast=args.fail_fast,
+            seed=args.seed,
+        )
 
 if __name__ == "__main__":
     main()
